@@ -1,178 +1,372 @@
-// --- שלב 1: ייבוא ספריות והגדרות ---
+/*
+ * ==========================================================
+ * ==   ESP32 Smart Bike Computer                          ==
+ * ==   Version: BLE + GPS + SD Card + GPX Analysis        ==
+ * ==========================================================
+ *
+ * This project reads speed and cadence from BLE sensors,
+ * reads GPS location and altitude, and reads a GPX route
+ * from SD card to anticipate upcoming climbs and suggest
+ * gear shifts accordingly.
+ *
+ * Industrial-style annotated version for education & portfolio
+ */
 
-#include <Wire.h> // ייבוא ספריית "Wire", משמשת לתקשורת I2C (עם המסך)
-#include <Adafruit_GFX.h> // ייבוא ספריית "GFX", ארגז כלים לציור צורות וטקסט
-#include <Adafruit_SSD1306.h> // ייבוא הדרייבר הספציפי למסך שלנו (SSD1306)
+// -----------------------------------------------------------------
+// --- BLOCK 1: Libraries (Toolbox) ---
+// -----------------------------------------------------------------
+#include <Wire.h>              // I2C communication for OLED display
+#include <Adafruit_GFX.h>      // Graphics library (shapes, text)
+#include <Adafruit_SSD1306.h>  // OLED display driver
 
+#include <BLEDevice.h>         // BLE device main library
+#include <BLEUtils.h>          
+#include <BLEScan.h>           
+#include <BLEClient.h>         
+#include <BLERemoteCharacteristic.h>
 
-// #define לטובת שינויים עדתידיים אם צריך
-#define SCREEN_WIDTH 128 // קביעת "כינוי" לרוחב המסך בפיקסלים
-#define SCREEN_HEIGHT 64 // קביעת "כינוי" לגובה המסך בפיקסלים
+#include <SPI.h>               // SPI communication (SD card)
+#include <SD.h>                // SD card management
+#include <TinyGPS++.h>         // GPS parsing library
 
-// פקודת יצירת "אובייקט" (ישות תוכנתית) של מסך:
+// -----------------------------------------------------------------
+// --- BLOCK 2: Hardware Definitions & Constants ---
+// -----------------------------------------------------------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-// 1. קורא לו 'display'
-// 2. אומר לו את הרוחב והגובה
-// 3. אומר לו להשתמש בספריית 'Wire' לתקשורת
-// 4. אומר לו שאין לנו פין איפוס (Reset) מחובר
 
-#define CRANK_SENSOR_PIN 34 // קביעת "כינוי" לפין 34, אליו נחבר את חיישן הפדל
-#define WHEEL_SENSOR_PIN 35 // קביעת "כינוי" לפין 35, אליו נחבר את חיישן הגלגל
+// Pins for GPS & SD card
+#define SD_CS_PIN 5            // Chip Select for SD
+#define GPS_RX_PIN 16          // RX pin ESP32 listens to GPS
+#define GPS_TX_PIN 17          // TX pin ESP32 sends to GPS
 
+static const uint32_t GPSBaud = 9600; // GPS serial baud rate
 
-// --- שלב 2: משתנים גלובליים ---
+// BLE addresses of sensors (Updated with your actual MACs!)
+static const char* speedSensorAddressStr   = "fa:77:64:cc:c4:fb"; 
+static const char* cadenceSensorAddressStr = "ce:30:ae:74:5e:32"; 
 
-/* (ההערות המעולות שלך על סוגי המשתנים)
-נזכור שfloat זה משתנים צפים כלומר מספר עם נק עשרונית
-נזכור שלונג מחיזק מספרי ענק שאינטיגר רגיל לא מסוגל
-volatile משתנה בעל ערך לא קבוע שיכול להשתנות בכל רגע נתון
-*/
+// Standard CSC service UUIDs (Cycling Speed & Cadence)
+static BLEUUID serviceUUID("00001816-0000-1000-8000-00805f9b34fb");
+static BLEUUID charUUID_CSC("00002a5b-0000-1000-8000-00805f9b34fb");
 
-// "מגירות" זיכרון למדידת זמן הפדל (חייב volatile כי הפסיקה משנה אותם)
-volatile unsigned long lastCrankEventTime = 0; // שומר את זמן הקליק האחרון של הפדל
-volatile unsigned long crankInterval = 0;      // שומר את הפרש הזמן בין שני קליקים בפדל
+// -----------------------------------------------------------------
+// --- BLOCK 3: Global Variables (System Memory) ---
+// -----------------------------------------------------------------
+TinyGPSPlus gps;               // GPS parsing object
+HardwareSerial gpsSerial(1);   // Serial1 dedicated for GPS
 
-// "מגירות" זיכרון למדידת זמן הגלגל (חייב volatile)
-volatile unsigned long lastWheelEventTime = 0; // שומר את זמן הקליק האחרון של הגלגל
-volatile unsigned long wheelInterval = 0;      // שומר את הפרש הזמן בין שני קליקים בגלגל
+volatile float crankRPM = 0.0;   // Pedal rotations per minute
+volatile float wheelRPM = 0.0;   // Wheel rotations per minute
+volatile float gearRatio = 0.0;  // Calculated gear ratio
 
-// "מגירות" זיכרון לתוצאות החישוב (float כי הן מספרים עשרוניים)
-float crankRPM = 0.0; // "מגירה" לשמירת חישוב סל"ד הפדל
-float wheelRPM = 0.0; // "מגירה" לשמירת חישוב סל"ד הגלגל
-float gearRatio = 0.0; // "מגירה" לשמירת חישוב יחס ההעברה
+// BLE connection flags
+static bool connectedSpeed = false;
+static bool connectedCadence = false;
+static BLERemoteCharacteristic* pRemoteCharSpeed = nullptr;
+static BLERemoteCharacteristic* pRemoteCharCadence = nullptr;
 
-// --- שלב 3: פונקציות הפסיקה (ISRs) ---
-// פונקציות מהירות שרצות אוטומטית כשהחיישן מזהה מגנט
+// Previous data storage (for delta calculations)
+uint32_t prevWheelRevCount = 0;
+uint16_t prevWheelEventTime = 0;
+bool hasPrevWheel = false;
 
-void IRAM_ATTR onCrank() {
-  // כאן נכתוב את הקוד שתופס את "הקליק" מהפדל
-  // 1. קח את הזמן הנוכחי במיקרו-שניות
-  unsigned long now = micros(); 
-  
-  // 2. חשב את הפרש הזמן מאז הפעם הקודמת
-  crankInterval = now - lastCrankEventTime; 
-  
-  // 3. שמור את הזמן הנוכחי בתור "הפעם הקודמת"
-  lastCrankEventTime = now;
+uint16_t prevCrankRevCount = 0;
+uint16_t prevCrankEventTime = 0;
+bool hasPrevCrank = false;
+
+// GPX-related variables
+volatile float currentAltitude = 0.0; 
+String gearAlert = ""; 
+unsigned long alertTimestamp = 0;
+
+// Timing variables for non-blocking operation
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastScanTime = 0;
+unsigned long lastGpxCheck = 0;
+
+const unsigned long DISPLAY_INTERVAL_MS = 200;   // refresh 5x/sec
+const unsigned long SCAN_INTERVAL_MS = 5000;     // BLE scan every 5s
+const unsigned long GPX_CHECK_INTERVAL_MS = 10000; // GPX check every 10s
+
+// -----------------------------------------------------------------
+// --- BLOCK 4: Helper Functions ---
+// -----------------------------------------------------------------
+
+// Wrap-around safe difference for 32-bit counters
+inline uint32_t diff32(uint32_t newv, uint32_t oldv) {
+  if (newv >= oldv) return newv - oldv;
+  return (uint32_t)((uint64_t)newv + (uint64_t)(UINT32_MAX - oldv) + 1ULL);
 }
 
-void IRAM_ATTR onWheel() {
-  // כאן נכתוב את הקוד שתופס את "הקליק" מהגלגל
-  // 1. קח את הזמן הנוכחי במיקרו-שניות
-  unsigned long now = micros();
-  
-  // 2. חשב את הפרש הזמן מאז הפעם הקודמת
-  wheelInterval = now - lastWheelEventTime;
-  
-  // 3. שמור את הזמן הנוכחי בתור "הפעם הקודמת"
-  lastWheelEventTime = now;
-
+// Wrap-around safe difference for 16-bit counters
+inline uint32_t diff16(uint16_t newv, uint16_t oldv) {
+  if (newv >= oldv) return (uint32_t)(newv - oldv);
+  return (uint32_t)((uint32_t)newv + (uint32_t)(UINT16_MAX - oldv) + 1U);
 }
 
-// --- שלב 4: פונקציית האתחול (setup) ---
-// פונקציה שרצה פעם אחת בלבד, כשה-ESP32 נדלק
+// Parse GPX values from line
+float parseValue(String line, String tag) {
+  int startIndex = line.indexOf(tag) + tag.length();
+  int endIndex = line.indexOf("\"", startIndex);
+  return line.substring(startIndex, endIndex).toFloat();
+}
 
+// Parse <ele> (elevation) from GPX line
+float parseElevation(String line) {
+  int startIndex = line.indexOf("<ele>") + 5;
+  int endIndex = line.indexOf("</ele>", startIndex);
+  return line.substring(startIndex, endIndex).toFloat();
+}
+
+// -----------------------------------------------------------------
+// --- BLOCK 5: BLE Core (Connection & Data Parsing) ---
+// -----------------------------------------------------------------
+
+// Main BLE notification callback
+static void cscNotifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
+                              uint8_t* pData, size_t length, bool isNotify) {
+  if (length < 1) return; // Protection: ignore corrupted packet
+
+  uint8_t idx = 0;
+  uint8_t flags = pData[idx++];
+  bool wheelPresent = flags & 0x01;
+  bool crankPresent = flags & 0x02;
+
+  // --- Wheel data ---
+  if (wheelPresent) {
+    if (idx + 6 <= length) {
+      uint32_t cumulativeWheelRevs = (uint32_t)pData[idx] | ((uint32_t)pData[idx+1] << 8) |
+                                     ((uint32_t)pData[idx+2] << 16) | ((uint32_t)pData[idx+3] << 24);
+      idx += 4;
+      uint16_t lastWheelEventTime = (uint16_t)pData[idx] | ((uint16_t)pData[idx+1] << 8);
+      idx += 2;
+
+      if (hasPrevWheel) {
+        uint32_t deltaRevs = diff32(cumulativeWheelRevs, prevWheelRevCount);
+        uint32_t deltaEventTime = diff16(lastWheelEventTime, prevWheelEventTime);
+
+        if (deltaEventTime > 0) {
+          float deltaTimeSec = (float)deltaEventTime / 1024.0f;
+          wheelRPM = ((float)deltaRevs / deltaTimeSec) * 60.0f; // update global
+        }
+      }
+      prevWheelRevCount = cumulativeWheelRevs;
+      prevWheelEventTime = lastWheelEventTime;
+      hasPrevWheel = true;
+    } else return;
+  }
+
+  // --- Crank (pedal) data ---
+  if (crankPresent) {
+    if (idx + 4 <= length) {
+      uint16_t cumulativeCrankRevs = (uint16_t)pData[idx] | ((uint16_t)pData[idx+1] << 8);
+      idx += 2;
+      uint16_t lastCrankEventTime = (uint16_t)pData[idx] | ((uint16_t)pData[idx+1] << 8);
+      idx += 2;
+
+      if (hasPrevCrank) {
+        uint32_t deltaRevs = diff16(cumulativeCrankRevs, prevCrankRevCount);
+        uint32_t deltaEventTime = diff16(lastCrankEventTime, prevCrankEventTime);
+
+        if (deltaEventTime > 0) {
+          float deltaTimeSec = (float)deltaEventTime / 1024.0f;
+          crankRPM = ((float)deltaRevs / deltaTimeSec) * 60.0f; // update global
+        }
+      }
+      prevCrankRevCount = cumulativeCrankRevs;
+      prevCrankEventTime = lastCrankEventTime;
+      hasPrevCrank = true;
+    } else return;
+  }
+}
+
+// BLE client callbacks
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    Serial.println("Client connected (BLE).");
+  }
+  void onDisconnect(BLEClient* pclient) {
+    Serial.println("Client disconnected (BLE).");
+  }
+};
+
+// Connect to a specific BLE sensor
+bool connectToSensor(const char* addressStr, BLERemoteCharacteristic** outChar, bool isSpeed) {
+  BLEAddress addr(addressStr);
+  Serial.print("Trying to connect to: "); Serial.println(addressStr);
+
+  BLEClient* pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  if (!pClient->connect(addr)) {
+    Serial.println("Failed to connect to device.");
+    pClient->disconnect(); delete pClient; return false;
+  }
+
+  BLERemoteService* pRemoteService = nullptr;
+  try { pRemoteService = pClient->getService(serviceUUID); } catch(...) { pRemoteService = nullptr; }
+  if (!pRemoteService) { pClient->disconnect(); delete pClient; return false; }
+
+  BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+  try { pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID_CSC); } catch(...) { pRemoteCharacteristic = nullptr; }
+  if (!pRemoteCharacteristic) { pClient->disconnect(); delete pClient; return false; }
+
+  if (pRemoteCharacteristic->canNotify())
+    pRemoteCharacteristic->registerForNotify(cscNotifyCallback);
+
+  *outChar = pRemoteCharacteristic;
+  return true;
+}
+
+// -----------------------------------------------------------------
+// --- BLOCK 6: GPS / GPX Core ---
+// -----------------------------------------------------------------
+
+void readGps() {
+  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
+  if (gps.altitude.isUpdated()) currentAltitude = gps.altitude.meters();
+}
+
+// Returns estimated altitude change in next 100 meters
+float getUpcomingSlope() {
+  if (!gps.location.isValid() || !gps.location.isUpdated()) return 0.0;
+
+  float myLat = gps.location.lat();
+  float myLon = gps.location.lng();
+
+  File gpxFile = SD.open("/route.gpx");
+  if (!gpxFile) return 0.0;
+
+  bool foundStartPoint = false;
+  float startLat, startLon, startAlt;
+  float currentLat, currentLon, currentAlt;
+  float distanceAccumulated = 0.0;
+
+  while (gpxFile.available()) {
+    String line = gpxFile.readStringUntil('\n');
+
+    if (line.indexOf("<trkpt") != -1) {
+      currentLat = parseValue(line, "lat=\"");
+      currentLon = parseValue(line, "lon=\"");
+
+      line = gpxFile.readStringUntil('\n'); 
+      if (line.indexOf("<ele>") != -1) currentAlt = parseElevation(line);
+
+      if (!foundStartPoint) {
+        float distanceToPoint = TinyGPSPlus::distanceBetween(myLat, myLon, currentLat, currentLon);
+        if (distanceToPoint < 25) { // within 25m
+          foundStartPoint = true;
+          startLat = currentLat; startLon = currentLon; startAlt = currentAlt;
+        }
+      } else {
+        distanceAccumulated += TinyGPSPlus::distanceBetween(startLat, startLon, currentLat, currentLon);
+        startLat = currentLat; startLon = currentLon;
+        if (distanceAccumulated >= 100.0) { 
+          gpxFile.close();
+          return currentAlt - startAlt;
+        }
+      }
+    }
+  }
+
+  gpxFile.close();
+  return 0.0;
+}
+
+// -----------------------------------------------------------------
+// --- BLOCK 7: Setup ---
+// -----------------------------------------------------------------
 void setup() {
-  // 1. אתחול המסך
-  // הפקודה .begin מנסה "לדבר" עם המסך בכתובת 0x3C (הכתובת הסטנדרטית)
-  // אם היא נכשלת (המסך לא מחובר נכון), היא מחזירה false
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
-    // אם נכשל, נתקע כאן לנצח. זה סימן לבדוק חיבורים.
-    for (;;); 
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  // Note: Since OLED is not connected yet, it will fail silently here, which is fine.
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ESP32 BLE Bike Computer");
+  display.println("Initializing...");
+  display.display();
+
+  BLEDevice::init("ESP32 Bike Computer");
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  if (!SD.begin(SD_CS_PIN)) {
+    display.println("SD Failed");
+    Serial.println("SD Not Connected - This is expected right now."); 
+  } else {
+    display.println("SD OK");
   }
 
-  // 2. ניקוי והצגת הודעת אתחול
-  display.clearDisplay(); // נקה את כל מה שהיה על המסך
-  display.setTextSize(1); // קבע גודל גופן קטן
-  display.setTextColor(SSD1306_WHITE); // קבע צבע טקסט לבן
-  display.setCursor(0, 0); // הזז את הסמן לפינה השמאלית העליונה
-  display.println("System booting..."); // הדפס את ההודעה
-  display.display(); // "דחוף" את כל מה שציירנו אל המסך
-  delay(1000); // המתן שנייה כדי שנספיק לראות את ההודעה
-
-  // 3. הגדרת פינים של חיישנים
-  // קובע את הפינים כ-INPUT (קלט)
-  // וה-PULLUP מפעיל נגד פנימי בתוך ה-ESP32
-  // שגורם לפין להיות "גבוה" (3.3V) כברירת מחדל
-  pinMode(CRANK_SENSOR_PIN, INPUT_PULLUP);
-  pinMode(WHEEL_SENSOR_PIN, INPUT_PULLUP);
-
-  // 4. חיבור הפסיקות (הפעלת ה"מלכודות")
-  // אומר ל-ESP32:
-  // "כאשר המתח בפין CRANK_SENSOR_PIN נופל (FALLING), תריץ את פונקציית onCrank"
-  attachInterrupt(digitalPinToInterrupt(CRANK_SENSOR_PIN), onCrank, FALLING);
-  // "כאשר המתח בפין WHEEL_SENSOR_PIN נופל (FALLING), תריץ את פונקציית onWheel"
-  attachInterrupt(digitalPinToInterrupt(WHEEL_SENSOR_PIN), onWheel, FALLING);
+  lastDisplayUpdate = millis();
+  lastScanTime = millis();
+  lastGpxCheck = millis() + 5000;
+  display.display();
 }
 
-// --- שלב 5: הלולאה הראשית (loop) ---
-// פונקציה שרצה בלולאה אינסופית אחרי ש-setup מסתיים
-
+// -----------------------------------------------------------------
+// --- BLOCK 8: Main Loop ---
+// -----------------------------------------------------------------
 void loop() {
-  // כאן נעשה את החישובים, נצייר למסך, ונחכה רגע
-  // --- 1. העתקה בטוחה של משתנים ---
-  // נצטרך לקרוא את המשתנים שהפסיקות כותבות אליהם.
-  // כדי למנוע מצב שאנחנו קוראים משתנה בדיוק כשהפסיקה כותבת עליו,
-  // נעתיק אותם במהירות למשתנים מקומיים כשהפסיקות כבויות.
-  
-  unsigned long localCrankInterval;
-  unsigned long localWheelInterval;
-  unsigned long localLastCrankTime;
-  unsigned long localLastWheelTime;
+  unsigned long now = millis();
 
-  noInterrupts(); // "אל תפריעו לי לשנייה" - כבה פסיקות
-  localCrankInterval = crankInterval;
-  localWheelInterval = wheelInterval;
-  localLastCrankTime = lastCrankEventTime;
-  localLastWheelTime = lastWheelEventTime;
-  interrupts(); // "סיימתי, אפשר להפריע" - הפעל פסיקות בחזרה
+  // 1) GPS reading
+  readGps();
 
-  // --- 2. חישוב סל"ד (RPM) ---
-  
-  // בדיקת "פסק זמן" לפדל:
-  // אם עברו יותר מ-2 שניות (2,000,000 מיקרו-שניות) מאז הקליק האחרון
-  if (micros() - localLastCrankTime > 2000000) {
-    crankRPM = 0.0; // נאפס את הסל"ד. הרוכב כנראה עצר.
-  } else if (localCrankInterval > 0) { // אם יש לנו מדידה תקפה
-    // חישוב: 60,000,000 (מיקרו-שניות בדקה) חלקי הזמן לסיבוב (במיקרו-שניות)
-    crankRPM = 60000000.0 / localCrankInterval;
+  // 2) BLE connection management
+  if (!connectedSpeed || !connectedCadence) {
+    if (now - lastScanTime > SCAN_INTERVAL_MS) {
+      lastScanTime = now;
+      if (!connectedSpeed)
+        connectedSpeed = connectToSensor(speedSensorAddressStr, &pRemoteCharSpeed, true);
+      if (!connectedCadence)
+        connectedCadence = connectToSensor(cadenceSensorAddressStr, &pRemoteCharCadence, false);
+    }
   }
 
-  // בדיקת "פסק זמן" לגלגל:
-  if (micros() - localLastWheelTime > 2000000) {
-    wheelRPM = 0.0; // נאפס את סל"ד הגלגל
-  } else if (localWheelInterval > 0) {
-    wheelRPM = 60000000.0 / localWheelInterval;
-  }
-  
-  // --- 3. חישוב יחס העברה ---
-  
-  // נחשב רק אם יש סל"ד פדל (כדי למנוע חלוקה באפס)
-  if (crankRPM > 0 && wheelRPM > 0) {
-    gearRatio = wheelRPM / crankRPM;
-  } else {
-    gearRatio = 0.0; // אם הפדל לא מסתובב, אין יחס
+  // 3) GPX slope analysis (low frequency)
+  if (now - lastGpxCheck > GPX_CHECK_INTERVAL_MS) {
+    lastGpxCheck = now;
+    float altitudeChange = getUpcomingSlope();
+    if (altitudeChange > 5.0 && crankRPM > 70.0) {
+      gearAlert = "SHIFT DOWN!";
+      alertTimestamp = millis();
+    }
   }
 
-  // --- 4. הצגת הנתונים על המסך ---
-  
-  display.clearDisplay(); // נקה את המסך לקראת הציור החדש
-  display.setCursor(0, 0);  // החזר את הסמן לפינה השמאלית העליונה
+  // 4) Gear ratio calculation
+  gearRatio = (crankRPM > 1e-6 && wheelRPM > 1e-6) ? wheelRPM / crankRPM : 0.0f;
 
-  // הדפסת כל הנתונים שחישבנו:
-  display.print("Crank RPM: ");
-  display.println(crankRPM, 1); // ", 1" = הצג ספרה אחת אחרי הנקודה
+  // 5) Display update
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
+    lastDisplayUpdate = now;
+    
+    // --- Added for Serial Monitor Testing (Since OLED isn't connected yet) ---
+    Serial.printf("BLE: %s/%s | Speed RPM: %.1f | Cadence RPM: %.1f | Gear: %.2f\n", 
+                  connectedSpeed ? "OK" : "-", 
+                  connectedCadence ? "OK" : "-", 
+                  wheelRPM, crankRPM, gearRatio);
+    // ------------------------------------------------------------------------
 
-  display.print("Wheel RPM: ");
-  display.println(wheelRPM, 1);
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.printf("BLE:%s%s GPS:%s SD:%s\n",
+                   connectedSpeed ? "S" : "-",
+                   connectedCadence ? "C" : "-",
+                   gps.location.isValid() ? "OK" : "NO",
+                   SD.begin(SD_CS_PIN) ? "OK" : "NO");
 
-  display.print("Gear Ratio: ");
-  display.println(gearRatio, 2); // ", 2" = הצג שתי ספרות אחרי הנקודה
+    display.printf("Crank RPM: %.1f\n", crankRPM);
+    display.printf("Wheel RPM: %.1f\n", wheelRPM);
+    display.printf("Gear Ratio: %.2f\n", gearRatio);
 
-  display.display(); // "דחוף" את הציור החדש למסך הפיזי
-  
-  // --- 5. המתנה קצרה ---
-  delay(100); // המתן 100 מילי-שניות (0.1 שנייה)
-                // זה יוצר קצב רענון של 10 פריימים בשנייה.
-                // זה מונע מהמסך להבהב מהר מדי ונעים לעין.
+    if (now - alertTimestamp <= 3000 && gearAlert.length() > 0)
+      display.printf("%s\n", gearAlert.c_str());
+
+    display.display();
+  }
 }
